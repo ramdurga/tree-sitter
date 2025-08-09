@@ -5,6 +5,9 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 import subprocess
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import partial
+import multiprocessing
 
 try:
     import tree_sitter_python as tspython
@@ -21,6 +24,13 @@ except ImportError:
     print("Installing graphviz for visualization...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "graphviz"])
     import graphviz
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    print("Installing tqdm for progress bars...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "tqdm"])
+    from tqdm import tqdm
 
 
 class CallFlowAnalyzer:
@@ -111,20 +121,136 @@ class CallFlowAnalyzer:
         else:
             return str(path.with_suffix('')).replace('/', '.')
     
-    def analyze_directory(self, directory: str) -> None:
-        """Analyze all Python files in a directory recursively."""
+    def analyze_directory(self, directory: str, max_workers: int = None) -> None:
+        """Analyze all Python files in a directory recursively using parallel processing."""
+        # Collect all Python files first
+        python_files = []
         for root, dirs, files in os.walk(directory):
             # Skip common directories that shouldn't be analyzed
             dirs[:] = [d for d in dirs if d not in {'.git', '__pycache__', '.venv', 'venv', 'node_modules'}]
             
             for file in files:
                 if file.endswith('.py'):
-                    file_path = os.path.join(root, file)
+                    python_files.append(os.path.join(root, file))
+        
+        if not python_files:
+            print("No Python files found in the specified directory.")
+            return
+        
+        print(f"Found {len(python_files)} Python files to analyze")
+        
+        # Use parallel processing with progress bar
+        if max_workers is None:
+            max_workers = min(multiprocessing.cpu_count(), len(python_files))
+        
+        # Process files in parallel
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all files for processing
+            futures = {executor.submit(self._parse_file_worker, file_path): file_path 
+                      for file_path in python_files}
+            
+            # Process results with progress bar
+            results = []
+            with tqdm(total=len(python_files), desc="Analyzing files", unit="file") as pbar:
+                for future in as_completed(futures):
+                    file_path = futures[future]
                     try:
-                        print(f"Analyzing: {file_path}")
-                        self.parse_file(file_path)
+                        result = future.result()
+                        if result:
+                            results.append(result)
+                            pbar.set_postfix_str(f"Last: {Path(file_path).name}")
                     except Exception as e:
-                        print(f"Error analyzing {file_path}: {e}")
+                        print(f"\nError analyzing {file_path}: {e}")
+                    finally:
+                        pbar.update(1)
+        
+        # Merge results from all workers
+        print("\nMerging results from parallel analysis...")
+        for functions, calls in tqdm(results, desc="Merging"):
+            # Merge functions
+            self.functions.update(functions)
+            # Merge calls
+            for caller, callees in calls.items():
+                self.calls[caller].update(callees)
+    
+    @staticmethod
+    def _parse_file_worker(file_path: str):
+        """Worker function for parallel file parsing."""
+        try:
+            # Create a new parser instance for this worker
+            PY_LANGUAGE = Language(tspython.language())
+            parser = Parser(PY_LANGUAGE)
+            
+            with open(file_path, 'rb') as f:
+                source_code = f.read()
+            
+            tree = parser.parse(source_code)
+            
+            # Extract functions and calls
+            functions = {}
+            calls = defaultdict(set)
+            
+            # Helper to get module path
+            def get_module_path(path):
+                p = Path(path)
+                if p.name == '__init__.py':
+                    return str(p.parent).replace('/', '.')
+                else:
+                    return str(p.with_suffix('')).replace('/', '.')
+            
+            # Extract functions
+            def extract_functions(node, functions_dict):
+                if node.type == 'function_definition':
+                    name_node = node.child_by_field_name('name')
+                    if name_node:
+                        func_name = source_code[name_node.start_byte:name_node.end_byte].decode('utf-8')
+                        line_number = name_node.start_point[0] + 1
+                        
+                        module_path = get_module_path(file_path)
+                        full_name = f"{module_path}.{func_name}" if module_path else func_name
+                        functions_dict[full_name] = (file_path, line_number)
+                        functions_dict[func_name] = (file_path, line_number)
+                
+                for child in node.children:
+                    extract_functions(child, functions_dict)
+            
+            # Extract calls
+            def extract_calls(node, calls_dict, current_function=None):
+                if node.type == 'function_definition':
+                    name_node = node.child_by_field_name('name')
+                    if name_node:
+                        current_function = source_code[name_node.start_byte:name_node.end_byte].decode('utf-8')
+                
+                if node.type == 'call':
+                    function_node = node.child_by_field_name('function')
+                    if function_node:
+                        if function_node.type == 'identifier':
+                            called_func = source_code[function_node.start_byte:function_node.end_byte].decode('utf-8')
+                        elif function_node.type == 'attribute':
+                            attr_node = function_node.child_by_field_name('attribute')
+                            if attr_node:
+                                called_func = source_code[attr_node.start_byte:attr_node.end_byte].decode('utf-8')
+                            else:
+                                called_func = source_code[function_node.start_byte:function_node.end_byte].decode('utf-8')
+                        else:
+                            called_func = source_code[function_node.start_byte:function_node.end_byte].decode('utf-8')
+                        
+                        if current_function:
+                            calls_dict[current_function].add(called_func)
+                        else:
+                            module_name = get_module_path(file_path)
+                            calls_dict[f"{module_name}.__main__"].add(called_func)
+                
+                for child in node.children:
+                    extract_calls(child, calls_dict, current_function)
+            
+            extract_functions(tree.root_node, functions)
+            extract_calls(tree.root_node, calls)
+            
+            return (functions, dict(calls))
+            
+        except Exception as e:
+            raise Exception(f"Error processing {file_path}: {e}")
     
     def identify_external_calls(self) -> None:
         """Identify calls to functions not defined in the codebase."""
@@ -135,7 +261,7 @@ class CallFlowAnalyzer:
         defined_funcs = set(self.functions.keys())
         self.external_calls = all_called - defined_funcs
     
-    def generate_dot_graph(self) -> str:
+    def generate_dot_graph(self, show_external: bool = True) -> str:
         """Generate a DOT graph representation of the call flow."""
         dot = graphviz.Digraph(comment='Call Flow Graph', format='svg')
         dot.attr(rankdir='TB')
@@ -159,7 +285,7 @@ class CallFlowAnalyzer:
                 if callee in self.functions:
                     # Internal call
                     dot.edge(caller_display, callee, color='black')
-                elif callee not in {'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set'}:
+                elif show_external and callee not in {'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set'}:
                     # External call (not a builtin)
                     dot.node(callee, callee, shape='ellipse', style='dashed', color='gray')
                     dot.edge(caller_display, callee, color='gray', style='dashed')
@@ -198,26 +324,35 @@ class CallFlowAnalyzer:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python call_flow_graph.py <directory_or_file> [output_file]")
-        print("\nExample:")
-        print("  python call_flow_graph.py ./my_project")
-        print("  python call_flow_graph.py ./my_project call_graph.svg")
-        sys.exit(1)
+    import argparse
     
-    target_path = sys.argv[1]
-    output_file = sys.argv[2] if len(sys.argv) > 2 else "call_flow_graph"
+    parser = argparse.ArgumentParser(description='Generate call flow graphs from Python code using tree-sitter')
+    parser.add_argument('target', help='Directory or file to analyze')
+    parser.add_argument('-o', '--output', default='call_flow_graph', help='Output file name (without extension)')
+    parser.add_argument('-w', '--workers', type=int, default=None, 
+                       help=f'Number of parallel workers (default: number of CPU cores, max {multiprocessing.cpu_count()})')
+    parser.add_argument('--no-external', action='store_true', help='Hide external/undefined function calls in the graph')
+    
+    args = parser.parse_args()
+    
+    if args.workers and args.workers > multiprocessing.cpu_count():
+        print(f"Warning: Using {multiprocessing.cpu_count()} workers (system maximum)")
+        args.workers = multiprocessing.cpu_count()
+    
+    print(f"🚀 Tree-Sitter Call Flow Analyzer")
+    print(f"  Using {args.workers or multiprocessing.cpu_count()} parallel workers")
+    print("-" * 50)
     
     analyzer = CallFlowAnalyzer(language='python')
     
-    if os.path.isfile(target_path):
-        print(f"Analyzing file: {target_path}")
-        analyzer.parse_file(target_path)
-    elif os.path.isdir(target_path):
-        print(f"Analyzing directory: {target_path}")
-        analyzer.analyze_directory(target_path)
+    if os.path.isfile(args.target):
+        print(f"Analyzing file: {args.target}")
+        analyzer.parse_file(args.target)
+    elif os.path.isdir(args.target):
+        print(f"Analyzing directory: {args.target}")
+        analyzer.analyze_directory(args.target, max_workers=args.workers)
     else:
-        print(f"Error: {target_path} is not a valid file or directory")
+        print(f"Error: {args.target} is not a valid file or directory")
         sys.exit(1)
     
     analyzer.identify_external_calls()
@@ -225,9 +360,9 @@ def main():
     
     # Generate and save the graph
     try:
-        dot_graph = analyzer.generate_dot_graph()
-        dot_graph.render(output_file, cleanup=True)
-        print(f"\n✓ Call flow graph saved to: {output_file}.svg")
+        dot_graph = analyzer.generate_dot_graph(show_external=not args.no_external)
+        dot_graph.render(args.output, cleanup=True)
+        print(f"\n✓ Call flow graph saved to: {args.output}.svg")
         print(f"  Open this file in a browser to view the interactive graph")
     except Exception as e:
         print(f"\nWarning: Could not generate graph visualization: {e}")
