@@ -130,16 +130,22 @@ class CallFlowAnalyzer:
         else:
             return str(path.with_suffix('')).replace('/', '.')
     
-    def analyze_directory(self, directory: str, max_workers: int = None) -> None:
+    def analyze_directory(self, directory: str, max_workers: int = None, include_hidden: bool = False) -> None:
         """Analyze all Python files in a directory recursively using parallel processing."""
         # Collect all Python files first
         python_files = []
         for root, dirs, files in os.walk(directory):
-            # Skip common directories that shouldn't be analyzed
-            dirs[:] = [d for d in dirs if d not in {'.git', '__pycache__', '.venv', 'venv', 'node_modules'}]
+            # Skip directories based on settings
+            if include_hidden:
+                # Only skip known build/cache directories
+                dirs[:] = [d for d in dirs if d not in {'__pycache__', 'venv', 'node_modules', '.git'}]
+            else:
+                # Skip all dot directories and common directories that shouldn't be analyzed
+                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in {'__pycache__', 'venv', 'node_modules'}]
             
             for file in files:
-                if file.endswith('.py'):
+                # Skip dot files unless include_hidden is True
+                if file.endswith('.py') and (include_hidden or not file.startswith('.')):
                     python_files.append(os.path.join(root, file))
         
         if not python_files:
@@ -270,6 +276,34 @@ class CallFlowAnalyzer:
         defined_funcs = set(self.functions.keys())
         self.external_calls = all_called - defined_funcs
     
+    def filter_library_calls(self) -> None:
+        """Remove all library calls (built-in and third-party) keeping only user-defined functions."""
+        # Common Python built-in functions and methods
+        builtins = {
+            'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple',
+            'bool', 'type', 'isinstance', 'issubclass', 'hasattr', 'getattr', 'setattr',
+            'delattr', 'callable', 'format', 'repr', 'hash', 'id', 'help', 'dir',
+            'abs', 'all', 'any', 'ascii', 'bin', 'chr', 'ord', 'compile', 'exec', 'eval',
+            'globals', 'locals', 'vars', 'open', 'input', 'oct', 'hex', 'round',
+            'divmod', 'pow', 'sum', 'min', 'max', 'sorted', 'reversed', 'enumerate',
+            'filter', 'map', 'zip', 'iter', 'next', 'slice', 'super', 'property',
+            'staticmethod', 'classmethod', 'object', 'bytes', 'bytearray', 'memoryview',
+            'complex', 'frozenset', '__import__', 'breakpoint'
+        }
+        
+        # Filter calls to keep only user-defined functions
+        filtered_calls = defaultdict(set)
+        for caller, callees in self.calls.items():
+            for callee in callees:
+                # Keep only if it's defined in our codebase
+                if callee in self.functions and callee not in builtins:
+                    filtered_calls[caller].add(callee)
+        
+        self.calls = filtered_calls
+        
+        # Update external calls to exclude built-ins
+        self.external_calls = {ext for ext in self.external_calls if ext not in builtins}
+    
     def generate_networkx_graph(self, show_external: bool = True) -> nx.DiGraph:
         """Generate a NetworkX directed graph for the call flow."""
         G = nx.DiGraph()
@@ -305,14 +339,189 @@ class CallFlowAnalyzer:
                     # Internal call
                     if G.has_node(callee):
                         G.add_edge(caller_display, callee, type='internal_call')
-                elif show_external and callee not in {'print', 'len', 'range', 'str', 'int', 'float', 
-                                                       'list', 'dict', 'set', 'tuple', 'bool', 'type'}:
+                elif show_external and callee in self.external_calls:
                     # External call (not a builtin)
                     if not G.has_node(callee):
                         G.add_node(callee, type='external_function')
                     G.add_edge(caller_display, callee, type='external_call')
         
         return G
+    
+    def generate_llm_analysis_files(self, target_directory: str, graph_name: str = "call_graph") -> None:
+        """Generate file lists for LLM analysis based on call relationships."""
+        # Create llm_analysis directory
+        if os.path.isfile(target_directory):
+            target_directory = os.path.dirname(target_directory)
+        
+        analysis_dir = os.path.join(target_directory, '.call_graphs', 'llm_analysis')
+        os.makedirs(analysis_dir, exist_ok=True)
+        
+        # 1. Generate entry points file (functions with no callers or main functions)
+        entry_points = []
+        called_functions = set()
+        for callees in self.calls.values():
+            called_functions.update(callees)
+        
+        for func_name, (file_path, line_no) in self.functions.items():
+            if '.' not in func_name:  # Skip duplicates
+                if func_name not in called_functions or func_name == 'main' or func_name.startswith('test_'):
+                    entry_points.append({
+                        'function': func_name,
+                        'file': file_path,
+                        'line': line_no
+                    })
+        
+        # 2. Generate call chains (depth-first traversal from entry points)
+        def get_call_chain(func, visited=None, depth=0, max_depth=10):
+            if visited is None:
+                visited = set()
+            if func in visited or depth > max_depth:
+                return []
+            
+            visited.add(func)
+            chains = []
+            
+            if func in self.calls:
+                for callee in self.calls[func]:
+                    if callee in self.functions:  # Only internal functions
+                        chains.append(callee)
+                        # Recursively get deeper calls
+                        sub_chains = get_call_chain(callee, visited.copy(), depth + 1, max_depth)
+                        chains.extend(sub_chains)
+            
+            return chains
+        
+        # 3. Group files by their interconnection strength
+        file_connections = defaultdict(lambda: defaultdict(int))
+        for caller, callees in self.calls.items():
+            if caller in self.functions:
+                caller_file = self.functions[caller][0]
+                for callee in callees:
+                    if callee in self.functions:
+                        callee_file = self.functions[callee][0]
+                        if caller_file != callee_file:
+                            file_connections[caller_file][callee_file] += 1
+        
+        # 4. Generate analysis groups (files that should be analyzed together)
+        analysis_groups = []
+        processed_files = set()
+        
+        for file_path in set(f for f, _ in self.functions.values()):
+            if file_path not in processed_files:
+                group = {file_path}
+                processed_files.add(file_path)
+                
+                # Add strongly connected files
+                if file_path in file_connections:
+                    connected = sorted(file_connections[file_path].items(), 
+                                     key=lambda x: x[1], reverse=True)
+                    for connected_file, count in connected[:3]:  # Top 3 connections
+                        if count > 1:  # At least 2 connections
+                            group.add(connected_file)
+                            processed_files.add(connected_file)
+                
+                analysis_groups.append(list(group))
+        
+        # 5. Save all analysis files
+        
+        # Entry points file
+        entry_points_file = os.path.join(analysis_dir, 'entry_points.json')
+        with open(entry_points_file, 'w') as f:
+            json.dump({
+                'description': 'Functions that serve as entry points to the codebase',
+                'entry_points': entry_points,
+                'total': len(entry_points)
+            }, f, indent=2)
+        
+        # Call chains file
+        call_chains = {}
+        for entry in entry_points:
+            func_name = entry['function']
+            chain = get_call_chain(func_name)
+            if chain:
+                call_chains[func_name] = {
+                    'file': entry['file'],
+                    'calls': chain,
+                    'depth': len(set(chain))
+                }
+        
+        call_chains_file = os.path.join(analysis_dir, 'call_chains.json')
+        with open(call_chains_file, 'w') as f:
+            json.dump({
+                'description': 'Call chains from entry points showing execution flow',
+                'chains': call_chains
+            }, f, indent=2)
+        
+        # File groups for analysis
+        file_groups_file = os.path.join(analysis_dir, 'file_groups.json')
+        with open(file_groups_file, 'w') as f:
+            json.dump({
+                'description': 'Groups of files that should be analyzed together due to strong coupling',
+                'groups': analysis_groups,
+                'total_groups': len(analysis_groups)
+            }, f, indent=2)
+        
+        # Complexity ranking (files by number of functions and calls)
+        file_complexity = defaultdict(lambda: {'functions': 0, 'outgoing_calls': 0, 'incoming_calls': 0})
+        
+        for func_name, (file_path, _) in self.functions.items():
+            if '.' not in func_name:
+                file_complexity[file_path]['functions'] += 1
+                
+        for caller, callees in self.calls.items():
+            if caller in self.functions:
+                caller_file = self.functions[caller][0]
+                file_complexity[caller_file]['outgoing_calls'] += len(callees)
+                
+                for callee in callees:
+                    if callee in self.functions:
+                        callee_file = self.functions[callee][0]
+                        file_complexity[callee_file]['incoming_calls'] += 1
+        
+        # Calculate complexity score
+        complexity_scores = []
+        for file_path, metrics in file_complexity.items():
+            score = (metrics['functions'] * 2 + 
+                    metrics['outgoing_calls'] + 
+                    metrics['incoming_calls'])
+            complexity_scores.append({
+                'file': file_path,
+                'complexity_score': score,
+                'functions': metrics['functions'],
+                'outgoing_calls': metrics['outgoing_calls'],
+                'incoming_calls': metrics['incoming_calls']
+            })
+        
+        complexity_scores.sort(key=lambda x: x['complexity_score'], reverse=True)
+        
+        complexity_file = os.path.join(analysis_dir, 'file_complexity.json')
+        with open(complexity_file, 'w') as f:
+            json.dump({
+                'description': 'Files ranked by complexity for prioritized analysis',
+                'files': complexity_scores
+            }, f, indent=2)
+        
+        # LLM prompt suggestions
+        prompts_file = os.path.join(analysis_dir, 'llm_prompts.md')
+        with open(prompts_file, 'w') as f:
+            f.write("# Suggested LLM Analysis Prompts\n\n")
+            f.write("## 1. Entry Point Analysis\n")
+            for entry in entry_points[:5]:  # Top 5 entry points
+                f.write(f"- Analyze the `{entry['function']}` function in `{entry['file']}` "
+                       f"(line {entry['line']}) and explain its purpose and flow\n")
+            
+            f.write("\n## 2. Complex File Analysis\n")
+            for file_info in complexity_scores[:5]:  # Top 5 complex files
+                f.write(f"- Review `{file_info['file']}` which has "
+                       f"{file_info['functions']} functions with "
+                       f"{file_info['outgoing_calls']} outgoing calls\n")
+            
+            f.write("\n## 3. Coupled Components Analysis\n")
+            for i, group in enumerate(analysis_groups[:3], 1):
+                if len(group) > 1:
+                    f.write(f"- Analyze the interaction between: {', '.join(group)}\n")
+        
+        print(f"  LLM analysis files created in: {analysis_dir}")
     
     def save_graphml(self, target_directory: str, graph_name: str = "call_graph", show_external: bool = True, verbose: bool = False) -> str:
         """Save the call flow graph as a GraphML file in .call_graphs directory."""
@@ -393,7 +602,7 @@ class CallFlowAnalyzer:
                 if callee in self.functions:
                     # Internal call
                     dot.edge(caller_display, callee, color='black')
-                elif show_external and callee not in {'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set'}:
+                elif show_external and callee in self.external_calls:
                     # External call (not a builtin)
                     dot.node(callee, callee, shape='ellipse', style='dashed', color='gray')
                     dot.edge(caller_display, callee, color='gray', style='dashed')
@@ -449,6 +658,10 @@ def main():
                        help='Output format: svg (Graphviz), graphml (NetworkX), or both (default: both)')
     parser.add_argument('--no-viz', action='store_true', help='Skip SVG visualization, only generate GraphML')
     parser.add_argument('-v', '--verbose', action='store_true', help='Show detailed analysis output')
+    parser.add_argument('--include-hidden', action='store_true', 
+                       help='Include hidden files and directories (those starting with dot)')
+    parser.add_argument('--user-functions-only', action='store_true',
+                       help='Show only user-defined functions, excluding all library calls')
     
     args = parser.parse_args()
     
@@ -468,12 +681,21 @@ def main():
         analyzer.parse_file(args.target)
     elif os.path.isdir(args.target):
         print(f"Analyzing directory: {args.target}")
-        analyzer.analyze_directory(args.target, max_workers=args.workers)
+        if not args.include_hidden and args.verbose:
+            print("  (Excluding hidden files and directories. Use --include-hidden to include them)")
+        analyzer.analyze_directory(args.target, max_workers=args.workers, include_hidden=args.include_hidden)
     else:
         print(f"Error: {args.target} is not a valid file or directory")
         sys.exit(1)
     
     analyzer.identify_external_calls()
+    
+    # Filter out library calls if requested
+    if args.user_functions_only:
+        analyzer.filter_library_calls()
+        if args.verbose:
+            print("  (Showing only user-defined functions, library calls excluded)")
+    
     analyzer.print_summary(verbose=args.verbose)
     
     # Save GraphML format (always saves to .call_graphs directory)
@@ -487,6 +709,10 @@ def main():
             )
             print(f"\n✓ GraphML saved to: {graphml_path}")
             print(f"  Latest version: {os.path.join(os.path.dirname(graphml_path), f'{args.output}_latest.graphml')}")
+            
+            # Generate LLM analysis files
+            analyzer.generate_llm_analysis_files(args.target, args.output)
+            
         except Exception as e:
             print(f"\nWarning: Could not save GraphML: {e}")
     
