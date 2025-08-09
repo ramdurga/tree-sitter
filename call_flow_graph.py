@@ -2,12 +2,14 @@
 
 import os
 import sys
+import json
 from pathlib import Path
 from collections import defaultdict
 import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 import multiprocessing
+from datetime import datetime
 
 try:
     import tree_sitter_python as tspython
@@ -31,6 +33,13 @@ except ImportError:
     print("Installing tqdm for progress bars...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "tqdm"])
     from tqdm import tqdm
+
+try:
+    import networkx as nx
+except ImportError:
+    print("Installing networkx for GraphML export...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "networkx"])
+    import networkx as nx
 
 
 class CallFlowAnalyzer:
@@ -261,6 +270,104 @@ class CallFlowAnalyzer:
         defined_funcs = set(self.functions.keys())
         self.external_calls = all_called - defined_funcs
     
+    def generate_networkx_graph(self, show_external: bool = True) -> nx.DiGraph:
+        """Generate a NetworkX directed graph for the call flow."""
+        G = nx.DiGraph()
+        
+        # Add nodes for all functions with metadata
+        for func_name, (file_path, line_no) in self.functions.items():
+            if '.' not in func_name:  # Skip duplicate entries with module paths
+                G.add_node(func_name, 
+                          file=Path(file_path).name,
+                          full_path=file_path,
+                          line=line_no,
+                          type='internal_function')
+        
+        # Track module-level calls
+        module_level_used = False
+        
+        # Add edges for function calls
+        for caller, callees in self.calls.items():
+            # Handle module-level calls
+            if '.__main__' in caller:
+                caller_display = 'module_level'
+                if not G.has_node(caller_display):
+                    G.add_node(caller_display, type='module_level')
+                    module_level_used = True
+            else:
+                caller_display = caller
+                if not G.has_node(caller_display):
+                    # Add caller if not already in graph (might be from external module)
+                    G.add_node(caller_display, type='function')
+            
+            for callee in callees:
+                if callee in self.functions:
+                    # Internal call
+                    if G.has_node(callee):
+                        G.add_edge(caller_display, callee, type='internal_call')
+                elif show_external and callee not in {'print', 'len', 'range', 'str', 'int', 'float', 
+                                                       'list', 'dict', 'set', 'tuple', 'bool', 'type'}:
+                    # External call (not a builtin)
+                    if not G.has_node(callee):
+                        G.add_node(callee, type='external_function')
+                    G.add_edge(caller_display, callee, type='external_call')
+        
+        return G
+    
+    def save_graphml(self, target_directory: str, graph_name: str = "call_graph", show_external: bool = True) -> str:
+        """Save the call flow graph as a GraphML file in .call_graphs directory."""
+        # Create .call_graphs directory in the target location
+        if os.path.isfile(target_directory):
+            target_directory = os.path.dirname(target_directory)
+        
+        graphs_dir = os.path.join(target_directory, '.call_graphs')
+        os.makedirs(graphs_dir, exist_ok=True)
+        
+        # Generate the NetworkX graph
+        G = self.generate_networkx_graph(show_external=show_external)
+        
+        # Add graph metadata
+        G.graph['name'] = graph_name
+        G.graph['total_functions'] = len(self.functions)
+        G.graph['total_calls'] = sum(len(calls) for calls in self.calls.values())
+        G.graph['analyzed_at'] = str(Path(target_directory).absolute())
+        
+        # Save as GraphML
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        graphml_file = os.path.join(graphs_dir, f"{graph_name}_{timestamp}.graphml")
+        
+        nx.write_graphml(G, graphml_file)
+        
+        # Also save a latest version for easy access
+        latest_file = os.path.join(graphs_dir, f"{graph_name}_latest.graphml")
+        nx.write_graphml(G, latest_file)
+        
+        # Save analysis summary as JSON
+        summary = {
+            'timestamp': timestamp,
+            'analyzed_directory': str(Path(target_directory).absolute()),
+            'total_files': len(set(path for path, _ in self.functions.values())),
+            'total_functions': len([f for f in self.functions.keys() if '.' not in f]),
+            'total_calls': sum(len(calls) for calls in self.calls.values()),
+            'total_external_calls': len(self.external_calls),
+            'graph_files': {
+                'graphml': os.path.basename(graphml_file),
+                'graphml_latest': os.path.basename(latest_file)
+            },
+            'functions': {name: {'file': path, 'line': line} 
+                         for name, (path, line) in self.functions.items() if '.' not in name},
+            'call_relationships': {caller: list(callees) for caller, callees in self.calls.items()},
+            'external_functions': list(self.external_calls)
+        }
+        
+        summary_file = os.path.join(graphs_dir, f"{graph_name}_summary.json")
+        with open(summary_file, 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        print(f"  Summary JSON: {summary_file}")
+        
+        return graphml_file
+    
     def generate_dot_graph(self, show_external: bool = True) -> str:
         """Generate a DOT graph representation of the call flow."""
         dot = graphviz.Digraph(comment='Call Flow Graph', format='svg')
@@ -332,6 +439,9 @@ def main():
     parser.add_argument('-w', '--workers', type=int, default=None, 
                        help=f'Number of parallel workers (default: number of CPU cores, max {multiprocessing.cpu_count()})')
     parser.add_argument('--no-external', action='store_true', help='Hide external/undefined function calls in the graph')
+    parser.add_argument('--format', choices=['svg', 'graphml', 'both'], default='both',
+                       help='Output format: svg (Graphviz), graphml (NetworkX), or both (default: both)')
+    parser.add_argument('--no-viz', action='store_true', help='Skip SVG visualization, only generate GraphML')
     
     args = parser.parse_args()
     
@@ -358,18 +468,32 @@ def main():
     analyzer.identify_external_calls()
     analyzer.print_summary()
     
-    # Generate and save the graph
-    try:
-        dot_graph = analyzer.generate_dot_graph(show_external=not args.no_external)
-        dot_graph.render(args.output, cleanup=True)
-        print(f"\n✓ Call flow graph saved to: {args.output}.svg")
-        print(f"  Open this file in a browser to view the interactive graph")
-    except Exception as e:
-        print(f"\nWarning: Could not generate graph visualization: {e}")
-        print("You may need to install Graphviz on your system:")
-        print("  - macOS: brew install graphviz")
-        print("  - Ubuntu/Debian: sudo apt-get install graphviz")
-        print("  - Windows: Download from https://graphviz.org/download/")
+    # Save GraphML format (always saves to .call_graphs directory)
+    if args.format in ['graphml', 'both']:
+        try:
+            graphml_path = analyzer.save_graphml(
+                args.target, 
+                graph_name=args.output,
+                show_external=not args.no_external
+            )
+            print(f"\n✓ GraphML saved to: {graphml_path}")
+            print(f"  Latest version: {os.path.join(os.path.dirname(graphml_path), f'{args.output}_latest.graphml')}")
+        except Exception as e:
+            print(f"\nWarning: Could not save GraphML: {e}")
+    
+    # Generate SVG visualization
+    if args.format in ['svg', 'both'] and not args.no_viz:
+        try:
+            dot_graph = analyzer.generate_dot_graph(show_external=not args.no_external)
+            dot_graph.render(args.output, cleanup=True)
+            print(f"\n✓ SVG visualization saved to: {args.output}.svg")
+            print(f"  Open this file in a browser to view the interactive graph")
+        except Exception as e:
+            print(f"\nWarning: Could not generate graph visualization: {e}")
+            print("You may need to install Graphviz on your system:")
+            print("  - macOS: brew install graphviz")
+            print("  - Ubuntu/Debian: sudo apt-get install graphviz")
+            print("  - Windows: Download from https://graphviz.org/download/")
 
 
 if __name__ == "__main__":
