@@ -314,7 +314,7 @@ class CallFlowAnalyzer:
         
         return G
     
-    def save_graphml(self, target_directory: str, graph_name: str = "call_graph", show_external: bool = True) -> str:
+    def save_graphml(self, target_directory: str, graph_name: str = "call_graph", show_external: bool = True, verbose: bool = False) -> str:
         """Save the call flow graph as a GraphML file in .call_graphs directory."""
         # Create .call_graphs directory in the target location
         if os.path.isfile(target_directory):
@@ -364,7 +364,8 @@ class CallFlowAnalyzer:
         with open(summary_file, 'w') as f:
             json.dump(summary, f, indent=2)
         
-        print(f"  Summary JSON: {summary_file}")
+        if verbose:
+            print(f"  Summary JSON: {summary_file}")
         
         return graphml_file
     
@@ -399,35 +400,40 @@ class CallFlowAnalyzer:
         
         return dot
     
-    def print_summary(self) -> None:
+    def print_summary(self, verbose: bool = False) -> None:
         """Print a summary of the analysis."""
+        unique_functions = [f for f in self.functions.keys() if '.' not in f]
+        unique_files = len(set(path for path, _ in self.functions.values()))
+        
         print("\n" + "="*60)
         print("CALL FLOW ANALYSIS SUMMARY")
         print("="*60)
+        print(f"Files analyzed: {unique_files}")
+        print(f"Functions found: {len(unique_functions)}")
+        print(f"Function calls tracked: {sum(len(calls) for calls in self.calls.values())}")
+        print(f"External functions called: {len(self.external_calls)}")
         
-        print(f"\nTotal functions found: {len(self.functions)}")
-        print(f"Total function calls tracked: {sum(len(calls) for calls in self.calls.values())}")
-        
-        print("\n--- Functions Defined ---")
-        for func_name, (file_path, line_no) in sorted(self.functions.items()):
-            if '.' not in func_name:  # Skip duplicates
-                print(f"  {func_name:30} -> {file_path}:{line_no}")
-        
-        print("\n--- Call Relationships ---")
-        for caller, callees in sorted(self.calls.items()):
-            if callees:
-                print(f"\n  {caller} calls:")
-                for callee in sorted(callees):
-                    if callee in self.functions:
-                        print(f"    -> {callee}")
-                    else:
-                        print(f"    -> {callee} (external)")
-        
-        if self.external_calls:
-            print("\n--- External/Undefined Functions Called ---")
-            for ext_call in sorted(self.external_calls):
-                if ext_call not in {'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set'}:
-                    print(f"  - {ext_call}")
+        if verbose:
+            print("\n--- Functions Defined ---")
+            for func_name, (file_path, line_no) in sorted(self.functions.items()):
+                if '.' not in func_name:  # Skip duplicates
+                    print(f"  {func_name:30} -> {file_path}:{line_no}")
+            
+            print("\n--- Call Relationships ---")
+            for caller, callees in sorted(self.calls.items()):
+                if callees:
+                    print(f"\n  {caller} calls:")
+                    for callee in sorted(callees):
+                        if callee in self.functions:
+                            print(f"    -> {callee}")
+                        else:
+                            print(f"    -> {callee} (external)")
+            
+            if self.external_calls:
+                print("\n--- External/Undefined Functions Called ---")
+                for ext_call in sorted(self.external_calls):
+                    if ext_call not in {'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set'}:
+                        print(f"  - {ext_call}")
 
 
 def main():
@@ -442,6 +448,7 @@ def main():
     parser.add_argument('--format', choices=['svg', 'graphml', 'both'], default='both',
                        help='Output format: svg (Graphviz), graphml (NetworkX), or both (default: both)')
     parser.add_argument('--no-viz', action='store_true', help='Skip SVG visualization, only generate GraphML')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Show detailed analysis output')
     
     args = parser.parse_args()
     
@@ -449,9 +456,10 @@ def main():
         print(f"Warning: Using {multiprocessing.cpu_count()} workers (system maximum)")
         args.workers = multiprocessing.cpu_count()
     
-    print(f"🚀 Tree-Sitter Call Flow Analyzer")
-    print(f"  Using {args.workers or multiprocessing.cpu_count()} parallel workers")
-    print("-" * 50)
+    if args.verbose:
+        print(f"🚀 Tree-Sitter Call Flow Analyzer")
+        print(f"  Using {args.workers or multiprocessing.cpu_count()} parallel workers")
+        print("-" * 50)
     
     analyzer = CallFlowAnalyzer(language='python')
     
@@ -466,7 +474,7 @@ def main():
         sys.exit(1)
     
     analyzer.identify_external_calls()
-    analyzer.print_summary()
+    analyzer.print_summary(verbose=args.verbose)
     
     # Save GraphML format (always saves to .call_graphs directory)
     if args.format in ['graphml', 'both']:
@@ -474,7 +482,8 @@ def main():
             graphml_path = analyzer.save_graphml(
                 args.target, 
                 graph_name=args.output,
-                show_external=not args.no_external
+                show_external=not args.no_external,
+                verbose=args.verbose
             )
             print(f"\n✓ GraphML saved to: {graphml_path}")
             print(f"  Latest version: {os.path.join(os.path.dirname(graphml_path), f'{args.output}_latest.graphml')}")
